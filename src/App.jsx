@@ -169,6 +169,21 @@ function toISODate(d) {
   return d.toISOString().slice(0, 10);
 }
 
+function classifyBrand(text) {
+  const s = String(text || "").toLowerCase();
+  if (s.includes("iphone") || s.includes("apple") || s.includes("ipad") || s.includes("macbook") || s.includes("airpods")) return "Apple";
+  if (s.includes("pixel")) return "Google Pixel";
+  if (s.includes("samsung") || s.includes("galaxy")) return "Samsung";
+  return "Інше";
+}
+
+function fmtSeconds(sec) {
+  if (sec == null || !isFinite(sec)) return "—";
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return m > 0 ? `${m} хв ${s} с` : `${s} с`;
+}
+
 function median(arr) {
   if (!arr.length) return null;
   const sorted = [...arr].sort((a, b) => a - b);
@@ -494,7 +509,7 @@ export default function MelofoneDashboard() {
     const within15 = responseTimes.length ? (responseTimes.filter((v) => v <= 15).length / responseTimes.length) * 100 : null;
     const within30 = responseTimes.length ? (responseTimes.filter((v) => v <= 30).length / responseTimes.length) * 100 : null;
 
-    const latest = [...ordersWithResponse].sort((a, b) => b.date - a.date).slice(0, 10);
+    const latest = [...ordersWithResponse].sort((a, b) => b.date - a.date);
 
     // --- GA4 traffic (filtered to the same period as orders) ---
     const gaRowsInPeriod = gaRows.filter((r) => {
@@ -506,6 +521,10 @@ export default function MelofoneDashboard() {
     const gaTotalUsers = gaRowsInPeriod.reduce((s, r) => s + (r.totalUsers || 0), 0);
     const gaAddToCarts = gaRowsInPeriod.reduce((s, r) => s + (r.addToCarts || 0), 0);
     const gaPurchases = gaRowsInPeriod.reduce((s, r) => s + (r.ecommercePurchases || 0), 0);
+    const gaTotalEngagementSec = gaRowsInPeriod.reduce((s, r) => s + (r.userEngagementDuration || 0), 0);
+    const gaTotalPageViews = gaRowsInPeriod.reduce((s, r) => s + (r.screenPageViews || 0), 0);
+    const avgSessionDurationSec = gaTotalSessions ? gaTotalEngagementSec / gaTotalSessions : null;
+    const pagesPerSession = gaTotalSessions ? gaTotalPageViews / gaTotalSessions : null;
     const gaChannelTotals = {};
     gaRowsInPeriod.forEach((r) => {
       gaChannelTotals[r.channel] = (gaChannelTotals[r.channel] || 0) + (r.sessions || 0);
@@ -518,6 +537,29 @@ export default function MelofoneDashboard() {
     const siteConversionRate = gaTotalSessions ? (successCount / gaTotalSessions) * 100 : null;
     const cartToOrderRate = gaAddToCarts ? (gaPurchases / gaAddToCarts) * 100 : null;
     const sessionToCartRate = gaTotalSessions ? (gaAddToCarts / gaTotalSessions) * 100 : null;
+    const orderPlacementRate = gaTotalSessions ? (total / gaTotalSessions) * 100 : null;
+
+    // --- Funnel by brand (from admin order data) ---
+    const brandGroups = {};
+    orders.forEach((o) => {
+      const brand = classifyBrand(o.product);
+      if (!brandGroups[brand]) brandGroups[brand] = { total: 0, success: 0, revenue: 0 };
+      brandGroups[brand].total += 1;
+      if (o.status === SUCCESS_STATUS) {
+        brandGroups[brand].success += 1;
+        brandGroups[brand].revenue += o.sum;
+      }
+    });
+    const brandOrder = ["Apple", "Samsung", "Google Pixel", "Інше"];
+    const brandFunnel = brandOrder
+      .filter((b) => brandGroups[b])
+      .map((b) => ({
+        brand: b,
+        total: brandGroups[b].total,
+        success: brandGroups[b].success,
+        revenue: brandGroups[b].revenue,
+        rate: brandGroups[b].total ? (brandGroups[b].success / brandGroups[b].total) * 100 : 0,
+      }));
 
     return {
       total, successCount, successRate, revenue, aov,
@@ -525,7 +567,8 @@ export default function MelofoneDashboard() {
       avgResponse, medianResponse, within15, within30,
       matchedCount: matched.length,
       gaTotalSessions, gaTotalUsers, gaAddToCarts, gaPurchases, gaChannelData,
-      siteConversionRate, cartToOrderRate, sessionToCartRate,
+      siteConversionRate, cartToOrderRate, sessionToCartRate, orderPlacementRate,
+      avgSessionDurationSec, pagesPerSession, brandFunnel,
     };
   }, [allOrders, calls, gaRows, periodStart, periodEnd]);
 
@@ -574,6 +617,18 @@ export default function MelofoneDashboard() {
           color: ${COLORS.text};
           color-scheme: dark;
         }
+        .mf-neon-blue {
+          color: #DFF1FF;
+          text-shadow: 0 0 4px ${COLORS.blue}, 0 0 14px ${COLORS.blue}, 0 0 28px ${COLORS.blue}99;
+        }
+        .mf-neon-amber {
+          color: #FFF3E0;
+          text-shadow: 0 0 4px ${COLORS.amber}, 0 0 14px ${COLORS.amber}, 0 0 28px ${COLORS.amber}99;
+        }
+        .mf-neon-green {
+          color: #E4FFF1;
+          text-shadow: 0 0 4px ${COLORS.green}, 0 0 14px ${COLORS.green}, 0 0 28px ${COLORS.green}99;
+        }
         table.mf-table { border-collapse: collapse; width: 100%; }
         table.mf-table th {
           text-align: left;
@@ -585,6 +640,10 @@ export default function MelofoneDashboard() {
           font-weight: 600;
           padding: 8px 10px;
           border-bottom: 1px solid ${COLORS.panelBorder};
+          position: sticky;
+          top: 0;
+          background: ${COLORS.panel};
+          z-index: 1;
         }
         table.mf-table td {
           padding: 9px 10px;
@@ -607,9 +666,9 @@ export default function MelofoneDashboard() {
           }}>
             MELOFONE.UA · SALES CONTROL
           </div>
-          <h1 style={{
+          <h1 className="mf-neon-blue" style={{
             margin: 0, fontFamily: "'Space Grotesk', sans-serif",
-            fontSize: 26, fontWeight: 700, color: COLORS.text,
+            fontSize: 26, fontWeight: 700,
           }}>
             Пульт воронки продажів
           </h1>
@@ -903,7 +962,7 @@ export default function MelofoneDashboard() {
                 </ResponsiveContainer>
               </Panel>
 
-              <Panel title="Воронка сайту (GA4 → адмінка)">
+              <Panel title={<span className="mf-neon-amber">Воронка сайту (GA4 → адмінка)</span>}>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10, paddingTop: 4 }}>
                   {[
                     { label: "Сесії (трафік)", value: metrics.gaTotalSessions, color: COLORS.blue },
@@ -943,6 +1002,12 @@ export default function MelofoneDashboard() {
                         <div style={{ fontSize: 11, color: COLORS.textMuted }}>сесія → успішне замовлення</div>
                       </div>
                     )}
+                    {metrics.orderPlacementRate != null && (
+                      <div>
+                        <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 18, color: "#A78BFA" }}>{metrics.orderPlacementRate.toFixed(2)}%</div>
+                        <div style={{ fontSize: 11, color: COLORS.textMuted }}>трафік → оформлення заявки</div>
+                      </div>
+                    )}
                   </div>
                   <div style={{ color: COLORS.textFaint, fontSize: 11.5, marginTop: 2 }}>
                     «Покупки (GA4)» — подія purchase, зафіксована самим сайтом; «Успішні замовлення (адмінка)» — реальний статус «Завершено» з файлу. Розбіжність між ними підказує, чи є втрати між оформленням і фактичним підтвердженням замовлення.
@@ -952,8 +1017,55 @@ export default function MelofoneDashboard() {
             </div>
           )}
 
-          <Panel title="Останні заявки">
-            <div style={{ overflowX: "auto" }}>
+          <div style={{ display: "grid", gridTemplateColumns: gaStatus === "success" ? "1fr 1fr" : "1fr", gap: 14, marginBottom: 14 }}>
+            {gaStatus === "success" && (
+              <Panel title="Якість трафіку (GA4)">
+                <div style={{ display: "flex", gap: 24, paddingTop: 4, flexWrap: "wrap" }}>
+                  <div>
+                    <div className="mf-neon-green" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 26 }}>
+                      {fmtSeconds(metrics.avgSessionDurationSec)}
+                    </div>
+                    <div style={{ fontSize: 12, color: COLORS.textMuted, marginTop: 2 }}>сер. час на сайті</div>
+                  </div>
+                  <div>
+                    <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 26, color: COLORS.text }}>
+                      {metrics.pagesPerSession != null ? metrics.pagesPerSession.toFixed(1) : "—"}
+                    </div>
+                    <div style={{ fontSize: 12, color: COLORS.textMuted, marginTop: 2 }}>сторінок за сесію</div>
+                  </div>
+                </div>
+              </Panel>
+            )}
+
+            {metrics.brandFunnel.length > 0 && (
+              <Panel title="Воронка за брендами">
+                <div style={{ display: "flex", flexDirection: "column", gap: 10, paddingTop: 4 }}>
+                  {metrics.brandFunnel.map((b, i) => (
+                    <div key={i}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 4 }}>
+                        <span style={{ color: COLORS.text }}>{b.brand}</span>
+                        <span style={{ fontFamily: "'JetBrains Mono', monospace", color: COLORS.textMuted }}>
+                          {b.success}/{b.total} · {b.rate.toFixed(0)}% · {fmtMoney(b.revenue)}
+                        </span>
+                      </div>
+                      <div style={{ height: 6, background: COLORS.panelBorder, borderRadius: 3 }}>
+                        <div style={{
+                          height: "100%", borderRadius: 3, background: COLORS.amber,
+                          width: `${Math.max(2, b.rate)}%`,
+                        }} />
+                      </div>
+                    </div>
+                  ))}
+                  <div style={{ color: COLORS.textFaint, fontSize: 11.5, marginTop: 2 }}>
+                    Бренд визначається за назвою товару в заявці. Показано: успішних/всього заявок · конверсія · виручка.
+                  </div>
+                </div>
+              </Panel>
+            )}
+          </div>
+
+          <Panel title="Заявки" right={<span style={{ fontSize: 12, color: COLORS.textFaint, fontFamily: "'JetBrains Mono', monospace" }}>{metrics.latest.length} за період</span>}>
+            <div style={{ overflowX: "auto", overflowY: "auto", maxHeight: 480 }}>
               <table className="mf-table">
                 <thead>
                   <tr>
