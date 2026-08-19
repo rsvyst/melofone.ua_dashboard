@@ -50,6 +50,9 @@ const STATUS_META = {
 
 const SUCCESS_STATUS = "Завершено";
 
+/* Admin export timestamps run 3 hours behind real Kyiv time — corrected on parse. */
+const ADMIN_TZ_CORRECTION_MS = 3 * 60 * 60 * 1000;
+
 function fmtMoney(n) {
   if (!isFinite(n)) return "—";
   return (
@@ -118,10 +121,12 @@ function parseProduct(val) {
 
 function normalizeRow(row) {
   const client = parseClient(row["Клієнт"]);
+  const rawDate = parseDate(row["Дата створення"]);
+  const date = rawDate ? new Date(rawDate.getTime() + ADMIN_TZ_CORRECTION_MS) : null;
   return {
     id: row["ID"],
     orderNo: row["Номер замовлення"],
-    date: parseDate(row["Дата створення"]),
+    date,
     status: String(row["Статус"] || "").trim(),
     product: parseProduct(row["Товари"]),
     sum: parseSum(row["Сума"]),
@@ -132,10 +137,36 @@ function normalizeRow(row) {
   };
 }
 
+/* If the same person (name+phone) has both a failed and a completed order,
+   treat the failed one(s) as duplicate checkout attempts and count only
+   the completed order. Groups with no completed order are left untouched. */
+function dedupeOrders(orders) {
+  const groups = {};
+  orders.forEach((o) => {
+    const key = `${normPhone(o.clientPhone)}|${(o.clientName || "").trim().toLowerCase()}`;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(o);
+  });
+  const result = [];
+  Object.values(groups).forEach((group) => {
+    const hasSuccess = group.some((o) => o.status === SUCCESS_STATUS);
+    if (hasSuccess) {
+      group.filter((o) => o.status === SUCCESS_STATUS).forEach((o) => result.push(o));
+    } else {
+      group.forEach((o) => result.push(o));
+    }
+  });
+  return result;
+}
+
 /* Last 9 digits — matches +380XXXXXXXXX, 380XXXXXXXXX, 0XXXXXXXXX etc. */
 function normPhone(p) {
   const digits = String(p || "").replace(/\D/g, "");
   return digits.slice(-9);
+}
+
+function toISODate(d) {
+  return d.toISOString().slice(0, 10);
 }
 
 function median(arr) {
@@ -276,7 +307,9 @@ function ResponseBadge({ minutes }) {
 }
 
 export default function MelofoneDashboard() {
-  const [orders, setOrders] = useState(null);
+  const [allOrders, setAllOrders] = useState(null);
+  const [periodStart, setPeriodStart] = useState("");
+  const [periodEnd, setPeriodEnd] = useState("");
   const [fileName, setFileName] = useState(null);
   const [updatedAt, setUpdatedAt] = useState(null);
   const [callsUpdatedAt, setCallsUpdatedAt] = useState(null);
@@ -292,11 +325,10 @@ export default function MelofoneDashboard() {
   const fileInputRef = useRef(null);
 
   const fetchGA4 = useCallback(async (normalizedOrders) => {
-    const dated = (normalizedOrders || orders || []).filter((o) => o.date);
+    const dated = (normalizedOrders || allOrders || []).filter((o) => o.date);
     if (!dated.length) return;
     const minDate = new Date(Math.min(...dated.map((o) => o.date.getTime())));
     const maxDate = new Date(Math.max(Math.max(...dated.map((o) => o.date.getTime())), Date.now()));
-    const toISODate = (d) => d.toISOString().slice(0, 10);
 
     setGaStatus("loading");
     setGaError(null);
@@ -314,10 +346,10 @@ export default function MelofoneDashboard() {
       setGaStatus("error");
       setGaError(String(err.message || err));
     }
-  }, [orders]);
+  }, [allOrders]);
 
   const fetchBinotel = useCallback(async (normalizedOrders) => {
-    const dated = (normalizedOrders || orders || []).filter((o) => o.date);
+    const dated = (normalizedOrders || allOrders || []).filter((o) => o.date);
     if (!dated.length) return;
     const minDate = new Date(Math.min(...dated.map((o) => o.date.getTime())));
     const maxDate = new Date(Math.max(...dated.map((o) => o.date.getTime())));
@@ -341,7 +373,7 @@ export default function MelofoneDashboard() {
       setBinotelStatus("error");
       setBinotelError(String(err.message || err));
     }
-  }, [orders]);
+  }, [allOrders]);
 
   const handleFile = useCallback((file) => {
     if (!file) return;
@@ -354,10 +386,15 @@ export default function MelofoneDashboard() {
         const wb = XLSX.read(data, { type: "array", cellDates: true });
         const sheet = wb.Sheets[wb.SheetNames[0]];
         const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-        const normalized = rows.map(normalizeRow).filter((r) => r.date);
-        setOrders(normalized);
+        const normalized = dedupeOrders(rows.map(normalizeRow).filter((r) => r.date));
+        setAllOrders(normalized);
         setFileName(file.name);
         setUpdatedAt(new Date());
+        const dates = normalized.map((o) => o.date.getTime());
+        if (dates.length) {
+          setPeriodStart(toISODate(new Date(Math.min(...dates))));
+          setPeriodEnd(toISODate(new Date(Math.max(...dates))));
+        }
         fetchBinotel(normalized);
         fetchGA4(normalized);
       } catch (err) {
@@ -374,7 +411,14 @@ export default function MelofoneDashboard() {
   }, [fetchBinotel, fetchGA4]);
 
   const metrics = useMemo(() => {
-    if (!orders || orders.length === 0) return null;
+    if (!allOrders || allOrders.length === 0) return null;
+
+    const rangeStart = periodStart ? new Date(`${periodStart}T00:00:00`) : null;
+    const rangeEnd = periodEnd ? new Date(`${periodEnd}T23:59:59`) : null;
+    const orders = allOrders.filter(
+      (o) => o.date && (!rangeStart || o.date >= rangeStart) && (!rangeEnd || o.date <= rangeEnd)
+    );
+    if (orders.length === 0) return null;
 
     const total = orders.length;
     const successOrders = orders.filter((o) => o.status === SUCCESS_STATUS);
@@ -452,12 +496,18 @@ export default function MelofoneDashboard() {
 
     const latest = [...ordersWithResponse].sort((a, b) => b.date - a.date).slice(0, 10);
 
-    // --- GA4 traffic ---
-    const gaTotalSessions = gaRows.reduce((s, r) => s + (r.sessions || 0), 0);
-    const gaTotalUsers = gaRows.reduce((s, r) => s + (r.totalUsers || 0), 0);
-    const gaConversions = gaRows.reduce((s, r) => s + (r.conversions || 0), 0);
+    // --- GA4 traffic (filtered to the same period as orders) ---
+    const gaRowsInPeriod = gaRows.filter((r) => {
+      if (!r.date || r.date.length !== 8) return true;
+      const d = new Date(`${r.date.slice(0, 4)}-${r.date.slice(4, 6)}-${r.date.slice(6, 8)}T12:00:00`);
+      return (!rangeStart || d >= new Date(`${periodStart}T00:00:00`)) && (!rangeEnd || d <= new Date(`${periodEnd}T23:59:59`));
+    });
+    const gaTotalSessions = gaRowsInPeriod.reduce((s, r) => s + (r.sessions || 0), 0);
+    const gaTotalUsers = gaRowsInPeriod.reduce((s, r) => s + (r.totalUsers || 0), 0);
+    const gaAddToCarts = gaRowsInPeriod.reduce((s, r) => s + (r.addToCarts || 0), 0);
+    const gaPurchases = gaRowsInPeriod.reduce((s, r) => s + (r.ecommercePurchases || 0), 0);
     const gaChannelTotals = {};
-    gaRows.forEach((r) => {
+    gaRowsInPeriod.forEach((r) => {
       gaChannelTotals[r.channel] = (gaChannelTotals[r.channel] || 0) + (r.sessions || 0);
     });
     const gaChannelPalette = [COLORS.blue, COLORS.amber, COLORS.green, COLORS.gray, COLORS.red, "#A78BFA", "#22D3EE"];
@@ -466,15 +516,18 @@ export default function MelofoneDashboard() {
       .slice(0, 7)
       .map(([name, value], i) => ({ name, value, color: gaChannelPalette[i % gaChannelPalette.length] }));
     const siteConversionRate = gaTotalSessions ? (successCount / gaTotalSessions) * 100 : null;
+    const cartToOrderRate = gaAddToCarts ? (gaPurchases / gaAddToCarts) * 100 : null;
+    const sessionToCartRate = gaTotalSessions ? (gaAddToCarts / gaTotalSessions) * 100 : null;
 
     return {
       total, successCount, successRate, revenue, aov,
       statusData, sourceData, dailyData, topProducts, latest, withPhone,
       avgResponse, medianResponse, within15, within30,
       matchedCount: matched.length,
-      gaTotalSessions, gaTotalUsers, gaConversions, gaChannelData, siteConversionRate,
+      gaTotalSessions, gaTotalUsers, gaAddToCarts, gaPurchases, gaChannelData,
+      siteConversionRate, cartToOrderRate, sessionToCartRate,
     };
-  }, [orders, calls, gaRows]);
+  }, [allOrders, calls, gaRows, periodStart, periodEnd]);
 
   return (
     <div style={{
@@ -511,6 +564,16 @@ export default function MelofoneDashboard() {
           color: ${COLORS.text};
         }
         .mf-btn-secondary:hover { filter: none; border-color: ${COLORS.amber}; }
+        .mf-date {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 13px;
+          background: ${COLORS.bg};
+          border: 1px solid ${COLORS.panelBorder};
+          border-radius: 6px;
+          padding: 6px 8px;
+          color: ${COLORS.text};
+          color-scheme: dark;
+        }
         table.mf-table { border-collapse: collapse; width: 100%; }
         table.mf-table th {
           text-align: left;
@@ -566,12 +629,12 @@ export default function MelofoneDashboard() {
             onChange={(e) => handleFile(e.target.files?.[0])}
           />
           <button className="mf-btn" onClick={() => fileInputRef.current?.click()} disabled={loading}>
-            {loading ? "Завантаження..." : orders ? "↻ Оновити дані (файл)" : "⇪ Завантажити файл замовлень"}
+            {loading ? "Завантаження..." : allOrders ? "↻ Оновити дані (файл)" : "⇪ Завантажити файл замовлень"}
           </button>
           <button
             className="mf-btn mf-btn-secondary"
             onClick={() => fetchBinotel()}
-            disabled={!orders || binotelStatus === "loading"}
+            disabled={!allOrders || binotelStatus === "loading"}
             title="Підтягнути свіжі дзвінки з Binotel без перезавантаження файлу заявок"
           >
             {binotelStatus === "loading" ? "Оновлення..." : "☎ Оновити дзвінки"}
@@ -579,13 +642,61 @@ export default function MelofoneDashboard() {
           <button
             className="mf-btn mf-btn-secondary"
             onClick={() => fetchGA4()}
-            disabled={!orders || gaStatus === "loading"}
+            disabled={!allOrders || gaStatus === "loading"}
             title="Підтягнути свіжі дані трафіку з Google Analytics"
           >
             {gaStatus === "loading" ? "Оновлення..." : "📈 Оновити трафік"}
           </button>
         </div>
       </div>
+
+      {allOrders && (
+        <div style={{
+          display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+          marginBottom: 20, padding: "10px 14px", background: COLORS.panel,
+          border: `1px solid ${COLORS.panelBorder}`, borderRadius: 8,
+        }}>
+          <span style={{
+            fontFamily: "'Space Grotesk', sans-serif", fontSize: 12, letterSpacing: "0.04em",
+            textTransform: "uppercase", color: COLORS.textMuted,
+          }}>
+            Період
+          </span>
+          <input
+            type="date"
+            className="mf-date"
+            value={periodStart}
+            max={periodEnd || undefined}
+            onChange={(e) => setPeriodStart(e.target.value)}
+          />
+          <span style={{ color: COLORS.textFaint }}>—</span>
+          <input
+            type="date"
+            className="mf-date"
+            value={periodEnd}
+            min={periodStart || undefined}
+            onChange={(e) => setPeriodEnd(e.target.value)}
+          />
+          {allOrders.length > 0 && (
+            <button
+              className="mf-btn mf-btn-secondary"
+              style={{ padding: "6px 12px", fontSize: 12 }}
+              onClick={() => {
+                const dates = allOrders.map((o) => o.date.getTime());
+                setPeriodStart(toISODate(new Date(Math.min(...dates))));
+                setPeriodEnd(toISODate(new Date(Math.max(...dates))));
+              }}
+            >
+              Весь період
+            </button>
+          )}
+          {metrics && (
+            <span style={{ fontSize: 12, color: COLORS.textFaint, marginLeft: "auto" }}>
+              {metrics.total} заявок у вибраному періоді
+            </span>
+          )}
+        </div>
+      )}
 
       {error && (
         <div style={{
@@ -614,13 +725,22 @@ export default function MelofoneDashboard() {
         </div>
       )}
 
-      {!orders && !loading && (
+      {!allOrders && !loading && (
         <div style={{
           border: `1px dashed ${COLORS.panelBorder}`, borderRadius: 10,
           padding: "50px 20px", textAlign: "center", color: COLORS.textMuted, fontSize: 14,
         }}>
           Натисніть «Завантажити файл замовлень» і оберіть експорт з адмінки (.xls / .xlsx).<br />
           Дашборд порахує метрики прямо в браузері та підтягне дзвінки з Binotel за цей період.
+        </div>
+      )}
+
+      {allOrders && !metrics && (
+        <div style={{
+          border: `1px dashed ${COLORS.panelBorder}`, borderRadius: 10,
+          padding: "50px 20px", textAlign: "center", color: COLORS.textMuted, fontSize: 14,
+        }}>
+          У вибраному періоді немає заявок. Розширте діапазон дат вище.
         </div>
       )}
 
@@ -783,25 +903,49 @@ export default function MelofoneDashboard() {
                 </ResponsiveContainer>
               </Panel>
 
-              <Panel title="Сайт vs. заявки">
-                <div style={{ display: "flex", flexDirection: "column", gap: 12, fontSize: 13, color: COLORS.textMuted, paddingTop: 4 }}>
-                  <div>Всього сесій на сайті: <span style={{ color: COLORS.text, fontFamily: "'JetBrains Mono', monospace" }}>{metrics.gaTotalSessions.toLocaleString("uk-UA")}</span></div>
-                  <div>Унікальних користувачів: <span style={{ color: COLORS.text, fontFamily: "'JetBrains Mono', monospace" }}>{metrics.gaTotalUsers.toLocaleString("uk-UA")}</span></div>
-                  <div>Подій-конверсій в GA4 (усі типи): <span style={{ color: COLORS.text, fontFamily: "'JetBrains Mono', monospace" }}>{metrics.gaConversions.toLocaleString("uk-UA")}</span></div>
-                  <div>Заявок з файлу адмінки: <span style={{ color: COLORS.text, fontFamily: "'JetBrains Mono', monospace" }}>{metrics.total}</span></div>
-                  <div>Успішних замовлень: <span style={{ color: COLORS.text, fontFamily: "'JetBrains Mono', monospace" }}>{metrics.successCount}</span></div>
-                  {metrics.siteConversionRate != null && (
-                    <div style={{
-                      marginTop: 4, fontSize: 22, fontFamily: "'JetBrains Mono', monospace", color: COLORS.green,
-                    }}>
-                      {metrics.siteConversionRate.toFixed(2)}%
-                      <span style={{ fontSize: 12, color: COLORS.textMuted, fontFamily: "'Inter', sans-serif", marginLeft: 8 }}>
-                        сесія → успішне замовлення
-                      </span>
+              <Panel title="Воронка сайту (GA4 → адмінка)">
+                <div style={{ display: "flex", flexDirection: "column", gap: 10, paddingTop: 4 }}>
+                  {[
+                    { label: "Сесії (трафік)", value: metrics.gaTotalSessions, color: COLORS.blue },
+                    { label: "Додано в кошик", value: metrics.gaAddToCarts, color: COLORS.amber },
+                    { label: "Покупки (GA4)", value: metrics.gaPurchases, color: COLORS.green },
+                    { label: "Успішні замовлення (адмінка)", value: metrics.successCount, color: COLORS.green },
+                  ].map((row, i) => (
+                    <div key={i}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 4 }}>
+                        <span style={{ color: COLORS.textMuted }}>{row.label}</span>
+                        <span style={{ fontFamily: "'JetBrains Mono', monospace", color: COLORS.text }}>{row.value.toLocaleString("uk-UA")}</span>
+                      </div>
+                      <div style={{ height: 6, background: COLORS.panelBorder, borderRadius: 3 }}>
+                        <div style={{
+                          height: "100%", borderRadius: 3, background: row.color,
+                          width: metrics.gaTotalSessions ? `${Math.max(2, Math.min(100, (row.value / metrics.gaTotalSessions) * 100))}%` : "0%",
+                        }} />
+                      </div>
                     </div>
-                  )}
+                  ))}
+                  <div style={{ display: "flex", gap: 18, marginTop: 6, flexWrap: "wrap" }}>
+                    {metrics.sessionToCartRate != null && (
+                      <div>
+                        <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 18, color: COLORS.amber }}>{metrics.sessionToCartRate.toFixed(1)}%</div>
+                        <div style={{ fontSize: 11, color: COLORS.textMuted }}>сесія → кошик</div>
+                      </div>
+                    )}
+                    {metrics.cartToOrderRate != null && (
+                      <div>
+                        <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 18, color: COLORS.green }}>{metrics.cartToOrderRate.toFixed(1)}%</div>
+                        <div style={{ fontSize: 11, color: COLORS.textMuted }}>кошик → покупка</div>
+                      </div>
+                    )}
+                    {metrics.siteConversionRate != null && (
+                      <div>
+                        <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 18, color: COLORS.blue }}>{metrics.siteConversionRate.toFixed(2)}%</div>
+                        <div style={{ fontSize: 11, color: COLORS.textMuted }}>сесія → успішне замовлення</div>
+                      </div>
+                    )}
+                  </div>
                   <div style={{ color: COLORS.textFaint, fontSize: 11.5, marginTop: 2 }}>
-                    «Подій-конверсій» — це задані в GA4 ключові події (заповнення форми, клік по кнопці тощо), а не тільки завершені замовлення — тому число вище й не дорівнює успішним замовленням.
+                    «Покупки (GA4)» — подія purchase, зафіксована самим сайтом; «Успішні замовлення (адмінка)» — реальний статус «Завершено» з файлу. Розбіжність між ними підказує, чи є втрати між оформленням і фактичним підтвердженням замовлення.
                   </div>
                 </div>
               </Panel>
