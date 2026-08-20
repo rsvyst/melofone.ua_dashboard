@@ -119,10 +119,27 @@ function parseProduct(val) {
   return firstLine || "—";
 }
 
+/* Parses the "Доставка" field, which typically looks like:
+   'У відділення "Нова пошта"\nАдреса: №:34, Дніпропетровська обл, Дніпро, Сергія Нігояна, 3'
+   or 'Самовивіз\nАдреса: Магазин Мелофоне' for in-store pickup. */
+function parseDelivery(val) {
+  const s = String(val || "");
+  if (/самовивіз/i.test(s)) return { city: "Самовивіз (магазин)", region: "Самовивіз (магазин)" };
+  const addrMatch = s.match(/Адреса:\s*(.+)/i);
+  if (!addrMatch) return { city: "Не визначено", region: "Не визначено" };
+  const parts = addrMatch[1].split(",").map((x) => x.trim()).filter(Boolean);
+  // Expected shape: [№:branch, Область, Місто, Вулиця, Будинок]
+  const region = parts.find((p) => /обл\.?$/i.test(p)) || parts[1] || "Не визначено";
+  const regionIndex = parts.indexOf(region);
+  const city = regionIndex >= 0 && parts[regionIndex + 1] ? parts[regionIndex + 1] : "Не визначено";
+  return { city, region };
+}
+
 function normalizeRow(row) {
   const client = parseClient(row["Клієнт"]);
   const rawDate = parseDate(row["Дата створення"]);
   const date = rawDate ? new Date(rawDate.getTime() + ADMIN_TZ_CORRECTION_MS) : null;
+  const delivery = parseDelivery(row["Доставка"]);
   return {
     id: row["ID"],
     orderNo: row["Номер замовлення"],
@@ -134,6 +151,8 @@ function normalizeRow(row) {
     clientPhone: client.phone,
     source: parseSource(row["UTM"]),
     payment: String(row["Оплата"] || "").split("\n")[0].trim(),
+    city: delivery.city,
+    region: delivery.region,
   };
 }
 
@@ -163,6 +182,16 @@ function dedupeOrders(orders) {
 function normPhone(p) {
   const digits = String(p || "").replace(/\D/g, "");
   return digits.slice(-9);
+}
+
+/* Manager working hours (Kyiv time) — calls outside this window are excluded
+   from response-time matching to keep the metric clean (auto-dialer noise,
+   wrong-number matches, etc). */
+const WORK_HOUR_START = 11;
+const WORK_HOUR_END = 19;
+function isWithinWorkingHours(unixSeconds) {
+  const hour = new Date(unixSeconds * 1000).getHours();
+  return hour >= WORK_HOUR_START && hour < WORK_HOUR_END;
 }
 
 function toISODate(d) {
@@ -336,6 +365,8 @@ export default function MelofoneDashboard() {
   const [gaStatus, setGaStatus] = useState("idle"); // idle | loading | success | error
   const [gaError, setGaError] = useState(null);
   const [gaRows, setGaRows] = useState([]);
+  const [geoRows, setGeoRows] = useState([]);
+  const [pageRows, setPageRows] = useState([]);
   const [gaUpdatedAt, setGaUpdatedAt] = useState(null);
   const fileInputRef = useRef(null);
 
@@ -355,6 +386,8 @@ export default function MelofoneDashboard() {
         throw new Error(data.message || "Проксі повернув помилку");
       }
       setGaRows(data.rows || []);
+      setGeoRows(data.geoRows || []);
+      setPageRows(data.pageRows || []);
       setGaStatus("success");
       setGaUpdatedAt(new Date());
     } catch (err) {
@@ -483,9 +516,10 @@ export default function MelofoneDashboard() {
 
     const withPhone = orders.filter((o) => o.clientPhone).length;
 
-    // --- Binotel: manager response time ---
+    // --- Binotel: manager response time (only calls within working hours count) ---
     const callsByPhone = {};
     calls.forEach((c) => {
+      if (!isWithinWorkingHours(c.time)) return;
       const key = normPhone(c.phone);
       if (!key) return;
       if (!callsByPhone[key]) callsByPhone[key] = [];
@@ -561,6 +595,77 @@ export default function MelofoneDashboard() {
         rate: brandGroups[b].total ? (brandGroups[b].success / brandGroups[b].total) * 100 : 0,
       }));
 
+    // --- Devices (GA4) ---
+    const deviceTotals = {};
+    gaRowsInPeriod.forEach((r) => {
+      const label = { mobile: "Мобільні", desktop: "Десктоп", tablet: "Планшети" }[r.device] || (r.device || "Інше");
+      deviceTotals[label] = (deviceTotals[label] || 0) + (r.sessions || 0);
+    });
+    const devicePalette = { "Мобільні": COLORS.blue, "Десктоп": COLORS.amber, "Планшети": COLORS.green };
+    const deviceData = Object.entries(deviceTotals)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, value]) => ({ name, value, color: devicePalette[name] || COLORS.gray }));
+
+    // --- Geography from GA4 (sessions by region/city) ---
+    const geoRowsInPeriod = geoRows.filter((r) => {
+      if (!r.date || r.date.length !== 8) return true;
+      const d = new Date(`${r.date.slice(0, 4)}-${r.date.slice(4, 6)}-${r.date.slice(6, 8)}T12:00:00`);
+      return (!rangeStart || d >= new Date(`${periodStart}T00:00:00`)) && (!rangeEnd || d <= new Date(`${periodEnd}T23:59:59`));
+    });
+    const gaRegionTotals = {};
+    const gaCityTotals = {};
+    geoRowsInPeriod.forEach((r) => {
+      const region = r.region || "Не визначено";
+      const city = r.city || "Не визначено";
+      gaRegionTotals[region] = (gaRegionTotals[region] || 0) + (r.sessions || 0);
+      gaCityTotals[city] = (gaCityTotals[city] || 0) + (r.sessions || 0);
+    });
+    const gaTopRegions = Object.entries(gaRegionTotals).sort((a, b) => b[1] - a[1]).slice(0, 8);
+    const gaTopCities = Object.entries(gaCityTotals).filter(([c]) => c !== "(not set)").sort((a, b) => b[1] - a[1]).slice(0, 8);
+
+    // --- Geography from admin orders (success vs failed by city) ---
+    const adminCityTotals = {};
+    orders.forEach((o) => {
+      const city = o.city || "Не визначено";
+      if (!adminCityTotals[city]) adminCityTotals[city] = { total: 0, success: 0, failed: 0 };
+      adminCityTotals[city].total += 1;
+      if (o.status === SUCCESS_STATUS) adminCityTotals[city].success += 1;
+      else adminCityTotals[city].failed += 1;
+    });
+    const adminCityStats = Object.entries(adminCityTotals)
+      .map(([city, v]) => ({ city, ...v }))
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 10);
+
+    // --- Page views for key site sections ---
+    const KEY_PAGES = [
+      { path: "/", label: "Головна сторінка" },
+      { path: "/promo", label: "Сторінка акції" },
+      { path: "/about-us", label: "Про компанію" },
+      { path: "/trade-in", label: "Trade-in" },
+      { path: "/delivery-and-payments", label: "Оплата та доставка" },
+      { path: "/product-return-and-complaint-terms", label: "Повернення та обмін" },
+      { path: "/contacts", label: "Контакти" },
+    ];
+    const pageRowsInPeriod = pageRows.filter((r) => {
+      if (!r.date || r.date.length !== 8) return true;
+      const d = new Date(`${r.date.slice(0, 4)}-${r.date.slice(4, 6)}-${r.date.slice(6, 8)}T12:00:00`);
+      return (!rangeStart || d >= new Date(`${periodStart}T00:00:00`)) && (!rangeEnd || d <= new Date(`${periodEnd}T23:59:59`));
+    });
+    const pageTotals = {};
+    pageRowsInPeriod.forEach((r) => {
+      const p = (r.path || "/").split("?")[0].replace(/\/$/, "") || "/";
+      if (!pageTotals[p]) pageTotals[p] = 0;
+      pageTotals[p] += r.pageViews || 0;
+    });
+    const keyPageStats = KEY_PAGES.map((kp) => ({ label: kp.label, path: kp.path, views: pageTotals[kp.path] || 0 }));
+    const keyPaths = new Set(KEY_PAGES.map((kp) => kp.path));
+    const topProductPages = Object.entries(pageTotals)
+      .filter(([p]) => !keyPaths.has(p))
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([path, views]) => ({ path, views }));
+
     return {
       total, successCount, successRate, revenue, aov,
       statusData, sourceData, dailyData, topProducts, latest, withPhone,
@@ -569,8 +674,9 @@ export default function MelofoneDashboard() {
       gaTotalSessions, gaTotalUsers, gaAddToCarts, gaPurchases, gaChannelData,
       siteConversionRate, cartToOrderRate, sessionToCartRate, orderPlacementRate,
       avgSessionDurationSec, pagesPerSession, brandFunnel,
+      deviceData, gaTopRegions, gaTopCities, adminCityStats, keyPageStats, topProductPages,
     };
-  }, [allOrders, calls, gaRows, periodStart, periodEnd]);
+  }, [allOrders, calls, gaRows, geoRows, pageRows, periodStart, periodEnd]);
 
   return (
     <div style={{
@@ -937,6 +1043,9 @@ export default function MelofoneDashboard() {
                 <div>Заявок зі знайденим дзвінком: <span style={{ color: COLORS.text, fontFamily: "'JetBrains Mono', monospace" }}>
                   {metrics.matchedCount} з {metrics.total}
                 </span></div>
+                <div style={{ color: COLORS.textFaint, fontSize: 11.5 }}>
+                  Враховуються лише дзвінки в робочий час менеджера ({WORK_HOUR_START}:00–{WORK_HOUR_END}:00) — це відсіює нічні/автоматичні дзвінки, що спотворюють метрику.
+                </div>
                 {binotelStatus !== "success" && (
                   <div style={{ color: COLORS.textFaint, marginTop: 4 }}>
                     Швидкість реакції менеджера рахується по номеру телефону клієнта та часу першого вихідного дзвінка з Binotel.
@@ -1063,6 +1172,127 @@ export default function MelofoneDashboard() {
               </Panel>
             )}
           </div>
+
+          {gaStatus === "success" && metrics.deviceData.length > 0 && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 14, marginBottom: 14 }}>
+              <Panel title="Пристрої (GA4)">
+                <ResponsiveContainer width="100%" height={200}>
+                  <PieChart>
+                    <Pie data={metrics.deviceData} dataKey="value" nameKey="name" innerRadius={50} outerRadius={80} paddingAngle={2}>
+                      {metrics.deviceData.map((entry, i) => (
+                        <Cell key={i} fill={entry.color} stroke={COLORS.panel} strokeWidth={2} />
+                      ))}
+                    </Pie>
+                    <Tooltip contentStyle={{ background: COLORS.panel, border: `1px solid ${COLORS.panelBorder}`, borderRadius: 8, fontSize: 12 }} />
+                    <Legend wrapperStyle={{ fontSize: 11, color: COLORS.textMuted }} />
+                  </PieChart>
+                </ResponsiveContainer>
+              </Panel>
+
+              <Panel title={<span className="mf-neon-blue">Географія трафіку (GA4)</span>}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+                  <div>
+                    <div style={{ fontSize: 11, color: COLORS.textMuted, textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>Області</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {metrics.gaTopRegions.map(([name, value], i) => (
+                        <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
+                          <span style={{ color: COLORS.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginRight: 8 }}>{name}</span>
+                          <span style={{ fontFamily: "'JetBrains Mono', monospace", color: COLORS.textMuted, flexShrink: 0 }}>{value.toLocaleString("uk-UA")}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 11, color: COLORS.textMuted, textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>Міста</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {metrics.gaTopCities.map(([name, value], i) => (
+                        <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
+                          <span style={{ color: COLORS.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginRight: 8 }}>{name}</span>
+                          <span style={{ fontFamily: "'JetBrains Mono', monospace", color: COLORS.textMuted, flexShrink: 0 }}>{value.toLocaleString("uk-UA")}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </Panel>
+            </div>
+          )}
+
+          {metrics.adminCityStats.length > 0 && (
+            <Panel title="Географія замовлень (адмінка): успішні vs неуспішні" >
+              <div style={{ overflowX: "auto" }}>
+                <table className="mf-table">
+                  <thead>
+                    <tr>
+                      <th>Місто</th>
+                      <th>Всього</th>
+                      <th>Успішні</th>
+                      <th>Неуспішні</th>
+                      <th>Конверсія</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {metrics.adminCityStats.map((c, i) => (
+                      <tr key={i}>
+                        <td>{c.city}</td>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace" }}>{c.total}</td>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace", color: COLORS.green }}>{c.success}</td>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace", color: COLORS.red }}>{c.failed}</td>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace" }}>{c.total ? ((c.success / c.total) * 100).toFixed(0) : 0}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div style={{ color: COLORS.textFaint, fontSize: 11.5, marginTop: 10 }}>
+                Місто визначається за адресою доставки Нової пошти з файлу заявок; самовивіз рахується окремим рядком.
+              </div>
+            </Panel>
+          )}
+
+          {gaStatus === "success" && metrics.keyPageStats.some((p) => p.views > 0) && (
+            <Panel title={<span className="mf-neon-amber">Перегляди сторінок (GA4)</span>}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {metrics.keyPageStats.map((p, i) => (
+                    <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12.5 }}>
+                      <div>
+                        <div style={{ color: COLORS.text }}>{p.label}</div>
+                        <div style={{ color: COLORS.textFaint, fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>{p.path}</div>
+                      </div>
+                      <span style={{
+                        fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: COLORS.blue,
+                        background: `${COLORS.blue}14`, borderRadius: 6, padding: "3px 9px", flexShrink: 0,
+                      }}>
+                        {p.views.toLocaleString("uk-UA")}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: COLORS.textMuted, textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>
+                    Топ товарних сторінок
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {metrics.topProductPages.map((p, i) => (
+                      <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12.5 }}>
+                        <span style={{ color: COLORS.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginRight: 8 }}>{p.path}</span>
+                        <span style={{
+                          fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: COLORS.amber,
+                          background: `${COLORS.amber}14`, borderRadius: 6, padding: "3px 9px", flexShrink: 0,
+                        }}>
+                          {p.views.toLocaleString("uk-UA")}
+                        </span>
+                      </div>
+                    ))}
+                    {metrics.topProductPages.length === 0 && (
+                      <div style={{ color: COLORS.textFaint, fontSize: 12 }}>Немає даних за період</div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </Panel>
+          )}
 
           <Panel title="Заявки" right={<span style={{ fontSize: 12, color: COLORS.textFaint, fontFamily: "'JetBrains Mono', monospace" }}>{metrics.latest.length} за період</span>}>
             <div style={{ overflowX: "auto", overflowY: "auto", maxHeight: 480 }}>
